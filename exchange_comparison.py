@@ -141,24 +141,29 @@ class ExchangeDataCollector:
         self.backpack_api_key = backpack_api_key
         self.backpack_api_secret = backpack_api_secret
         
-        # HTTP客户端
-        self.http_client = httpx.AsyncClient(timeout=10.0)
+        # 连接状态
+        self.backpack_connected = False
+        self.zklighter_connected = False
+        
+        # 停止事件
+        self.stop_event = asyncio.Event()
     
     async def close(self):
-        """关闭HTTP客户端"""
-        await self.http_client.aclose()
+        """关闭所有资源"""
+        pass
     
     def handle_backpack_ticker(self, symbol, ticker_data):
         """处理Backpack价格数据"""
+        # 初始化数据结构（如果需要）
         if symbol not in self.backpack_data:
             self.backpack_data[symbol] = {}
         
         # 从ticker数据中提取我们需要的字段
-        if 'c' in ticker_data:  # 'c' 是最新价格
+        if 'last' in ticker_data:  # 'last' 是最新价格
             try:
-                self.backpack_data[symbol]['last_price'] = float(ticker_data['c'])
+                self.backpack_data[symbol]['last_price'] = float(ticker_data['last'])
             except (ValueError, TypeError):
-                logger.warning(f"无法转换Backpack价格: {ticker_data['c']}")
+                logger.warning(f"无法转换Backpack价格: {ticker_data['last']}")
         
         # 记录更新时间
         self.backpack_data[symbol]['update_time'] = time.time()
@@ -204,99 +209,114 @@ class ExchangeDataCollector:
         self.update_unified_data()
     
     async def fetch_backpack_funding_rates(self):
-        """获取Backpack所有交易对的资金费率"""
+        """获取Backpack资金费率数据"""
         try:
-            # 先尝试单独获取每个交易对的资金费率
-            for symbol in BACKPACK_TRADING_PAIRS:
-                try:
-                    # 构建API请求URL
-                    url = f"{BACKPACK_REST_URL}/api/v1/fundingRates?symbol={symbol}"
-                    logger.debug(f"请求资金费率: {url}")
-                    
-                    # 发送请求
-                    response = await self.http_client.get(url)
-                    
-                    if response.status_code == 200:
-                        # 解析响应
-                        data = response.json()
+            logger.info("正在获取Backpack资金费率数据...")
+            
+            # 创建需要获取资金费率的交易对列表
+            pairs_to_fetch = []
+            for pair in BACKPACK_TRADING_PAIRS:
+                if pair.endswith("_PERP"):  # 只获取永续合约
+                    pairs_to_fetch.append(pair)
+            
+            if not pairs_to_fetch:
+                logger.warning("没有需要获取资金费率的交易对")
+                return
+            
+            async with httpx.AsyncClient() as client:
+                for symbol in pairs_to_fetch:
+                    try:
+                        # 使用正确的资金费率API路径
+                        url = f"{BACKPACK_REST_URL}/api/v1/fundingRates?symbol={symbol}"
+                        logger.debug(f"请求资金费率: {url}")
                         
-                        # 处理数据
-                        if data and isinstance(data, list) and len(data) > 0:
-                            for item in data:
-                                if "fundingRate" in item:
-                                    try:
-                                        # 将资金费率乘以100，与backpack_market_table.py保持一致
-                                        funding_rate = float(item["fundingRate"]) * 100
-                                        
-                                        # 更新市场数据
-                                        if symbol not in self.backpack_data:
-                                            self.backpack_data[symbol] = {}
-                                        
-                                        self.backpack_data[symbol]['funding_rate'] = funding_rate
-                                        
-                                        logger.debug(f"获取到Backpack {symbol}资金费率: {funding_rate}")
-                                        break  # 找到了就跳出循环
-                                    except (ValueError, TypeError) as e:
-                                        logger.warning(f"无法转换{symbol}的资金费率: {item.get('fundingRate')}, 错误: {e}")
-                    else:
-                        logger.warning(f"获取{symbol}资金费率失败，状态码: {response.status_code}")
-                except Exception as e:
-                    logger.error(f"获取{symbol}资金费率出错: {e}")
-            
-            # 更新统一格式数据
-            self.update_unified_data()
-            
-            logger.info(f"已获取Backpack资金费率数据")
+                        response = await client.get(url)
+                        if response.status_code != 200:
+                            logger.error(f"获取{symbol}资金费率失败: HTTP {response.status_code}")
+                            continue
+                            
+                        funding_data = response.json()
+                        
+                        # 确保返回的数据是列表且不为空
+                        if not funding_data or not isinstance(funding_data, list):
+                            logger.warning(f"{symbol}资金费率数据格式错误: {funding_data}")
+                            continue
+                        
+                        # 获取最新的资金费率（列表中的第一个元素）
+                        latest_funding = funding_data[0]
+                        if "fundingRate" not in latest_funding:
+                            logger.warning(f"{symbol}资金费率数据缺少fundingRate字段: {latest_funding}")
+                            continue
+                        
+                        # 确保交易对有初始化的数据结构
+                        if symbol not in self.backpack_data:
+                            self.backpack_data[symbol] = {}
+                            
+                        # 解析资金费率并转换为百分比
+                        funding_rate = float(latest_funding["fundingRate"]) * 100
+                        self.backpack_data[symbol]['funding_rate'] = funding_rate
+                        
+                        # 记录当前时间作为更新时间
+                        self.backpack_data[symbol]['funding_time'] = time.time()
+                        
+                        logger.info(f"Backpack {symbol} 资金费率: {funding_rate:+.6f}%")
+                        
+                        # 避免API请求过于频繁
+                        await asyncio.sleep(0.2)
+                    
+                    except Exception as e:
+                        logger.error(f"获取{symbol}资金费率时出错: {e}")
+                
+                # 更新计数器和时间
+                self.backpack_last_update = time.time()
+                
+                # 更新统一数据
+                self.update_unified_data()
+                
+                logger.info("Backpack资金费率数据更新完成")
         except Exception as e:
-            logger.error(f"获取Backpack资金费率出错: {e}")
-            logger.debug(traceback.format_exc())
+            logger.error(f"获取Backpack资金费率时出错: {e}")
+            logger.error(traceback.format_exc())
     
     async def fetch_backpack_prices(self):
         """获取Backpack所有交易对的价格"""
         try:
             # 使用REST API获取所有价格
-            url = f"{BACKPACK_REST_URL}/api/v1/tickers"
-            logger.debug(f"请求所有ticker数据: {url}")
-            
-            response = await self.http_client.get(url)
-            
-            if response.status_code == 200:
-                tickers = response.json()
+            async with httpx.AsyncClient() as client:
+                url = f"{BACKPACK_REST_URL}/api/v1/tickers"
+                logger.debug(f"请求所有ticker数据: {url}")
                 
-                for ticker in tickers:
-                    symbol = ticker.get("symbol")
+                response = await client.get(url)
+                
+                if response.status_code == 200:
+                    tickers = response.json()
                     
-                    # 只处理我们关注的交易对
-                    if symbol in BACKPACK_TRADING_PAIRS:
-                        # 更新市场数据
-                        if symbol not in self.backpack_data:
-                            self.backpack_data[symbol] = {}
+                    for ticker in tickers:
+                        symbol = ticker.get("symbol")
                         
-                        # 转换价格数据
-                        for field_name, api_field in [
-                            ('last_price', 'lastPrice'),
-                            ('index_price', 'indexPrice'),
-                            ('mark_price', 'markPrice')
-                        ]:
-                            field_value = ticker.get(api_field, ticker.get('lastPrice') if api_field != 'lastPrice' else None)
-                            if field_value is not None:
-                                try:
-                                    self.backpack_data[symbol][field_name] = float(field_value)
-                                except (ValueError, TypeError):
-                                    logger.warning(f"无法转换Backpack {api_field}: {field_value}")
-                        
-                        # 记录更新时间
-                        self.backpack_data[symbol]['update_time'] = time.time()
-                
-                # 更新统一格式数据
-                self.update_unified_data()
-                
-                logger.info(f"已获取Backpack价格数据")
-            else:
-                logger.warning(f"获取Backpack价格数据失败，状态码: {response.status_code}")
+                        # 只处理我们关注的交易对
+                        if symbol in BACKPACK_TRADING_PAIRS:
+                            # 初始化数据结构（如果需要）
+                            if symbol not in self.backpack_data:
+                                self.backpack_data[symbol] = {}
+                            
+                            # 转换价格数据
+                            try:
+                                self.backpack_data[symbol]['last_price'] = float(ticker.get('lastPrice', 0))
+                            except (ValueError, TypeError):
+                                logger.warning(f"无法转换Backpack价格: {ticker.get('lastPrice')}")
+                            
+                            # 记录更新时间
+                            self.backpack_data[symbol]['update_time'] = time.time()
+                    
+                    # 更新统一格式数据
+                    self.update_unified_data()
+                    
+                    logger.info(f"已获取Backpack价格数据")
+                else:
+                    logger.warning(f"获取Backpack价格数据失败，状态码: {response.status_code}")
         except Exception as e:
             logger.error(f"获取Backpack价格数据出错: {e}")
-            logger.debug(traceback.format_exc())
     
     def update_unified_data(self):
         """更新统一格式的数据，用于对比显示"""
@@ -535,225 +555,222 @@ class ExchangeDataCollector:
             print("按 Ctrl+C 退出程序")
         except Exception as e:
             logger.error(f"显示表格时出错: {e}")
-            logger.debug(traceback.format_exc())
 
-async def monitor_exchanges(backpack_api_key=None, backpack_api_secret=None):
-    """监控多个交易所数据"""
-    print("交易所数据对比工具")
-    print("=" * 50)
-    
+async def main():
+    """主函数"""
     # 创建数据收集器
-    collector = ExchangeDataCollector(backpack_api_key, backpack_api_secret)
+    collector = ExchangeDataCollector()
+    
+    # 获取初始数据
+    print("正在获取初始数据...")
+    await collector.fetch_backpack_prices()
+    await collector.fetch_backpack_funding_rates()
+    
+    # 创建任务
+    tasks = [
+        asyncio.create_task(connect_zklighter(collector)),
+        asyncio.create_task(connect_backpack(collector)),
+        asyncio.create_task(update_display(collector)),
+        asyncio.create_task(update_funding_rates(collector))
+    ]
     
     try:
-        # 创建SSL上下文
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        
-        # 先获取一次初始数据
-        print("正在获取初始数据...")
-        await collector.fetch_backpack_prices()
-        await collector.fetch_backpack_funding_rates()
-        
-        # 创建多个异步任务
-        zklighter_task = asyncio.create_task(connect_zklighter(collector, ssl_context))
-        backpack_task = asyncio.create_task(connect_backpack(collector, ssl_context))
-        display_task = asyncio.create_task(update_display(collector))
-        funding_update_task = asyncio.create_task(update_funding_rates(collector))
-        
-        # 等待所有任务完成（实际上会一直运行直到被中断）
-        await asyncio.gather(
-            zklighter_task, 
-            backpack_task, 
-            display_task, 
-            funding_update_task
-        )
-    
+        # 等待用户中断
+        await asyncio.gather(*tasks)
     except asyncio.CancelledError:
-        logger.info("任务被取消")
-    except Exception as e:
-        logger.error(f"监控交易所数据时出错: {e}")
-        logger.debug(traceback.format_exc())
-    
+        # 取消所有任务
+        for task in tasks:
+            task.cancel()
+        # 等待任务取消完成
+        await asyncio.gather(*tasks, return_exceptions=True)
+    except KeyboardInterrupt:
+        print("\n程序已终止")
     finally:
-        # 确保关闭HTTP客户端
+        # 关闭收集器资源
         await collector.close()
 
-async def connect_zklighter(collector, ssl_context):
-    """连接到zkLighter WebSocket并处理数据"""
+async def connect_zklighter(collector):
+    """连接到zkLighter WebSocket并获取数据"""
     while True:
         try:
-            logger.info("正在连接到zkLighter交易所WebSocket API...")
+            collector.zklighter_connected = False
+            logger.info("正在连接到zkLighter WebSocket API...")
             
-            # 创建WebSocket连接
-            async with websockets.connect(
-                ZKLIGHTER_WS_URL, 
-                ssl=ssl_context,
-                ping_interval=None,
-                close_timeout=10,
-                max_size=10 * 1024 * 1024
-            ) as websocket:
-                logger.info("zkLighter WebSocket连接已建立")
+            async with websockets.connect(ZKLIGHTER_WS_URL) as ws:
+                collector.zklighter_connected = True
+                logger.info("已连接到zkLighter WebSocket API")
                 
-                # 为每个市场ID创建订阅
+                # 订阅市场数据
                 for market_id in ZKLIGHTER_MARKET_IDS:
-                    subscribe_message = {
+                    subscribe_msg = {
                         "type": "subscribe",
                         "channel": f"market_stats/{market_id}"
                     }
-                    await websocket.send(json.dumps(subscribe_message))
+                    await ws.send(json.dumps(subscribe_msg))
                     logger.debug(f"已订阅zkLighter市场ID={market_id}")
                 
-                # 持续接收和处理消息
+                # 保持连接的ping计时器
+                last_ping_time = time.time()
+                
+                # 不断接收消息
                 while True:
                     try:
-                        response = await websocket.recv()
+                        # 每30秒发送ping保持连接活跃
+                        current_time = time.time()
+                        if current_time - last_ping_time > 30:
+                            logger.debug("向zkLighter发送ping")
+                            pong_waiter = await ws.ping()
+                            try:
+                                await asyncio.wait_for(pong_waiter, timeout=5)
+                                logger.debug("收到zkLighter的pong响应")
+                            except asyncio.TimeoutError:
+                                logger.warning("zkLighter pong响应超时，重新连接")
+                                break
+                            last_ping_time = current_time
                         
-                        # 解析响应
+                        # 设置接收超时，以便定期发送ping
+                        message = await asyncio.wait_for(ws.recv(), timeout=10)
+                        
+                        # 解析并处理消息
                         try:
-                            data = json.loads(response)
+                            data = json.loads(message)
+                            if data.get('type') in ['update/market_stats', 'subscribed/market_stats'] and 'market_stats' in data:
+                                collector.handle_zklighter_market_stats(data['market_stats'])
                         except json.JSONDecodeError:
-                            continue
-                        
-                        # 处理市场统计数据
-                        if data.get('type') in ['update/market_stats', 'subscribed/market_stats'] and 'market_stats' in data:
-                            collector.handle_zklighter_market_stats(data['market_stats'])
-                        
+                            logger.warning(f"无法解析zkLighter消息: {message[:100]}...")
+                    
+                    except asyncio.TimeoutError:
+                        # 接收超时，继续循环（可能会触发ping）
+                        continue
                     except Exception as e:
                         logger.error(f"处理zkLighter消息时出错: {e}")
-                        if not isinstance(e, asyncio.TimeoutError):
-                            logger.debug(traceback.format_exc())
-        
-        except websockets.exceptions.ConnectionClosedError as e:
-            logger.error(f"zkLighter WebSocket连接已关闭: {e}")
-            logger.info("尝试重新连接zkLighter...")
-            await asyncio.sleep(5)
-            continue
+                        if isinstance(e, websockets.exceptions.ConnectionClosed):
+                            logger.warning("zkLighter连接已关闭，重新连接")
+                            break
         
         except Exception as e:
-            logger.error(f"zkLighter连接错误: {e}")
-            logger.debug(traceback.format_exc())
-            await asyncio.sleep(5)
-            continue
+            collector.zklighter_connected = False
+            logger.error(f"zkLighter WebSocket连接出错: {e}")
+        
+        # 等待5秒后重试
+        logger.info("5秒后重新连接到zkLighter...")
+        await asyncio.sleep(5)
 
-async def connect_backpack(collector, ssl_context):
-    """连接到Backpack WebSocket并处理数据"""
+async def connect_backpack(collector):
+    """连接到Backpack WebSocket并获取数据"""
     while True:
         try:
-            logger.info("正在连接到Backpack交易所WebSocket API...")
+            collector.backpack_connected = False
+            logger.info("正在连接到Backpack WebSocket API...")
             
-            # 创建WebSocket连接
-            async with websockets.connect(
-                BACKPACK_WS_URL, 
-                ssl=ssl_context,
-                ping_interval=None,
-                close_timeout=10,
-                max_size=10 * 1024 * 1024
-            ) as websocket:
-                logger.info("Backpack WebSocket连接已建立")
+            async with websockets.connect(BACKPACK_WS_URL) as ws:
+                collector.backpack_connected = True
+                logger.info("已连接到Backpack WebSocket API")
                 
-                # 订阅所有交易对的ticker数据
-                subscription_channels = [f"ticker.{symbol}" for symbol in BACKPACK_TRADING_PAIRS]
+                # 订阅所有交易对
+                for trading_pair in BACKPACK_TRADING_PAIRS:
+                    subscribe_msg = {
+                        "op": "subscribe",
+                        "channel": "ticker",
+                        "market": trading_pair
+                    }
+                    await ws.send(json.dumps(subscribe_msg))
+                    logger.debug(f"已订阅Backpack交易对: {trading_pair}")
                 
-                # 构建订阅消息
-                subscribe_msg = {
-                    "method": "SUBSCRIBE",
-                    "params": subscription_channels,
-                    "id": 1
-                }
+                # 保持连接的ping计时器
+                last_ping_time = time.time()
                 
-                # 发送订阅请求
-                await websocket.send(json.dumps(subscribe_msg))
-                logger.info(f"已发送Backpack订阅请求，共 {len(subscription_channels)} 个交易对")
-                
-                # 持续接收和处理消息
+                # 不断接收消息
                 while True:
                     try:
-                        response = await websocket.recv()
+                        # 每30秒发送ping保持连接活跃
+                        current_time = time.time()
+                        if current_time - last_ping_time > 30:
+                            logger.debug("向Backpack发送ping")
+                            pong_waiter = await ws.ping()
+                            try:
+                                await asyncio.wait_for(pong_waiter, timeout=5)
+                                logger.debug("收到Backpack的pong响应")
+                            except asyncio.TimeoutError:
+                                logger.warning("Backpack pong响应超时，重新连接")
+                                break
+                            last_ping_time = current_time
                         
-                        # 解析响应
+                        # 设置接收超时，以便定期发送ping
+                        message = await asyncio.wait_for(ws.recv(), timeout=10)
+                        
+                        # 解析并处理消息
                         try:
-                            data = json.loads(response)
+                            data = json.loads(message)
+                            
+                            # 处理订阅确认
+                            if "type" in data and data.get("type") == "subscribed":
+                                logger.debug(f"已确认订阅Backpack: {data.get('channel')} - {data.get('market')}")
+                                continue
+                            
+                            # 处理行情更新
+                            if "type" in data and data.get("type") == "update" and data.get("channel") == "ticker":
+                                market = data.get("market")
+                                ticker_data = data.get("data", {})
+                                if market and ticker_data:
+                                    collector.handle_backpack_ticker(market, ticker_data)
+                        
                         except json.JSONDecodeError:
-                            logger.warning(f"无法解析Backpack WebSocket响应: {response[:100]}...")
-                            continue
-                        
-                        # 处理订阅确认消息
-                        if "id" in data and data.get("id") == 1 and "result" in data:
-                            logger.info("Backpack订阅确认: " + str(data.get("result")))
-                            continue
-                        
-                        # 处理ticker数据
-                        if "data" in data and "stream" in data:
-                            stream = data["stream"]
-                            if stream.startswith("ticker."):
-                                symbol = stream[7:]  # 去掉"ticker."前缀
-                                ticker_data = data["data"]
-                                collector.handle_backpack_ticker(symbol, ticker_data)
-                        
+                            logger.warning(f"无法解析Backpack消息: {message[:100]}...")
+                    
+                    except asyncio.TimeoutError:
+                        # 接收超时，继续循环（可能会触发ping）
+                        continue
                     except Exception as e:
                         logger.error(f"处理Backpack消息时出错: {e}")
-                        if not isinstance(e, asyncio.TimeoutError):
-                            logger.debug(traceback.format_exc())
-        
-        except websockets.exceptions.ConnectionClosedError as e:
-            logger.error(f"Backpack WebSocket连接已关闭: {e}")
-            logger.info("尝试重新连接Backpack...")
-            await asyncio.sleep(5)
-            continue
+                        if isinstance(e, websockets.exceptions.ConnectionClosed):
+                            logger.warning("Backpack连接已关闭，重新连接")
+                            break
         
         except Exception as e:
-            logger.error(f"Backpack连接错误: {e}")
-            logger.debug(traceback.format_exc())
-            await asyncio.sleep(5)
-            continue
+            collector.backpack_connected = False
+            logger.error(f"Backpack WebSocket连接出错: {e}")
+        
+        # 等待5秒后重试
+        logger.info("5秒后重新连接到Backpack...")
+        await asyncio.sleep(5)
 
 async def update_display(collector):
-    """定期更新显示"""
-    update_interval = 3  # 秒
+    """定期更新表格显示"""
+    update_interval = 3  # 每3秒更新一次
     
     while True:
         try:
             # 显示表格
             collector.display_comparison_table()
-            logger.info("表格已更新")
             
-            # 等待到下次更新
+            # 等待下次更新
             await asyncio.sleep(update_interval)
-        
         except Exception as e:
-            logger.error(f"更新显示时出错: {e}")
-            logger.debug(traceback.format_exc())
+            logger.error(f"更新表格显示出错: {e}")
             await asyncio.sleep(update_interval)
 
 async def update_funding_rates(collector):
     """定期更新资金费率"""
-    update_interval = 60  # 秒
+    update_interval = 60  # 每60秒更新一次
     
     while True:
         try:
-            # 更新Backpack资金费率
+            # 更新资金费率
             await collector.fetch_backpack_funding_rates()
             
-            # 等待到下次更新
+            # 等待下次更新
             await asyncio.sleep(update_interval)
-        
         except Exception as e:
-            logger.error(f"更新资金费率时出错: {e}")
-            logger.debug(traceback.format_exc())
-            await asyncio.sleep(update_interval)
+            logger.error(f"更新资金费率出错: {e}")
+            await asyncio.sleep(5)  # 出错时等待5秒
 
 if __name__ == "__main__":
     try:
-        # 可选: 从环境变量获取API密钥
-        backpack_api_key = os.environ.get("BACKPACK_API_KEY", "")
-        backpack_api_secret = os.environ.get("BACKPACK_API_SECRET", "")
-        
-        # 启动监控
-        asyncio.run(monitor_exchanges(backpack_api_key, backpack_api_secret))
+        # 运行主程序
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("\n程序已终止")
     except Exception as e:
         logger.error(f"主程序异常: {e}")
-        logger.debug(traceback.format_exc()) 
+        logger.error(traceback.format_exc()) 
